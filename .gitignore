@@ -4,6 +4,10 @@ node_modules
 # Build
 dist
 dist-ssr
+dist-server
+
+# Data
+data
 *.local
 
 # Editor
@@ -17,3 +21,5 @@ npm-debug.log*
 
 # OS
 .DS_Store
+# Environment
+.env
