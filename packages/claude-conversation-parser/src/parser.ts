@@ -1,0 +1,1386 @@
+import * as fs from 'fs';
+import {
+  ConversationMessage,
+  ConversationHighlight,
+  ToolCall,
+  SessionStatus,
+  QuestionOption,
+  Question,
+  SessionUsage,
+  CompactionEvent,
+  TaskItem,
+  FileChange,
+} from './types';
+import { APPROVAL_TOOLS, KNOWN_TOOL_NAMES, getToolDescription, isKnownTool } from './tool-config';
+import { PARSER_WARNING_RATE_LIMIT_MS, PARSER_DEDUP_KEY_PREVIEW_LENGTH, FILE_ACTIVITY_READ_BUFFER_SIZE, COMMAND_LOG_PREVIEW_LENGTH, QUESTION_PREVIEW_LENGTH, TOOL_DESCRIPTION_PREVIEW_LENGTH, TOOL_APPROVAL_PREVIEW_LENGTH, SHORT_COMMAND_DISPLAY_LENGTH, TOOL_INPUT_SUMMARY_LENGTH, MAX_TOOL_OUTPUT_SIZE, MAX_SUMMARY_TEXT_LENGTH } from './constants';
+import { BoundedMap } from './utils';
+
+// Metrics hook - can be overridden by consumers
+let _onMessagesParsed: ((count: number) => void) | null = null;
+export function setMessagesParsedCallback(fn: (count: number) => void): void {
+  _onMessagesParsed = fn;
+}
+
+// Re-export TaskItem for tests
+export { TaskItem } from './types';
+// Re-export FileChange for tests
+export { FileChange } from './types';
+
+interface ContentBlock {
+  type: string;
+  text?: string;
+  id?: string; // For tool_use blocks
+  tool_use_id?: string; // For tool_result blocks
+  name?: string;
+  input?: unknown;
+  content?: string | Array<{ type: string; text?: string }>; // For tool_result blocks
+}
+
+interface JsonlEntry {
+  type: string;
+  subtype?: string;
+  message?: {
+    role?: string;
+    content?: string | ContentBlock[];
+  };
+  timestamp?: string;
+  parentUuid?: string;
+  uuid?: string;
+  summary?: string;
+  content?: string;
+}
+
+interface AskUserQuestionInput {
+  questions?: Array<{
+    question: string;
+    header: string;
+    options: Array<{ label: string; description: string }>;
+    multiSelect?: boolean;
+  }>;
+}
+
+const MAX_MESSAGES = Infinity; // No cap — full conversation available for infinite scroll
+
+/**
+ * Strip cross-session noise from compaction summary content.
+ * Claude Code's context compaction includes system-reminder blocks (CLAUDE.md, MEMORY.md),
+ * injected file contents, and internal XML tags. These reference other sessions/projects
+ * and confuse users when displayed in the Companion app.
+ */
+function cleanCompactionSummary(text: string): string {
+  let cleaned = text;
+
+  // Remove <system-reminder>...</system-reminder> blocks (may span many lines)
+  cleaned = cleaned.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '');
+
+  // Remove <command-name>...</command-name> tags (system-injected skill markers)
+  cleaned = cleaned.replace(/<command-name>[^<]*<\/command-name>/g, '');
+
+  // Remove "Contents of /path/to/file" header lines (injected file contents)
+  cleaned = cleaned.replace(/^[ \t]*Contents of \/[^\n]*$/gm, '');
+
+  // Remove lines referencing CLAUDE.md or MEMORY.md paths
+  cleaned = cleaned.replace(/^[^\n]*(?:CLAUDE\.md|MEMORY\.md)[^\n]*$/gm, '');
+
+  // Collapse multiple blank lines into one
+  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+
+  // Trim leading/trailing whitespace
+  cleaned = cleaned.trim();
+
+  // If everything was stripped, return a generic marker
+  return cleaned || 'Context compacted';
+}
+
+// KNOWN_TOOLS alias for backward compatibility in this file
+const KNOWN_TOOLS = KNOWN_TOOL_NAMES;
+
+// Rate-limit parser warnings: max one per key per 60s
+const _warnedRecently = new BoundedMap<string, number>(1000);
+function logParserWarning(type: string, details: string): void {
+  const key = `${type}:${details.substring(0, PARSER_DEDUP_KEY_PREVIEW_LENGTH)}`;
+  const now = Date.now();
+  const last = _warnedRecently.get(key);
+  if (last && now - last < PARSER_WARNING_RATE_LIMIT_MS) return;
+  _warnedRecently.set(key, now);
+  console.log(`[PARSER_WARN] ${type}: ${details}`);
+}
+
+/**
+ * Fast function to detect current activity by reading only the last few KB of a file.
+ * Much faster than parsing the entire conversation file.
+ * Tracks tool_result entries to avoid showing stale "pending" status for completed tools.
+ */
+export function detectCurrentActivityFast(filePath: string): string | undefined {
+  if (!fs.existsSync(filePath)) {
+    return undefined;
+  }
+
+  try {
+    const stats = fs.statSync(filePath);
+    const fileSize = stats.size;
+
+    // Read last 32KB - enough to get recent messages
+    const readSize = Math.min(FILE_ACTIVITY_READ_BUFFER_SIZE, fileSize);
+    const buffer = Buffer.alloc(readSize);
+    const fd = fs.openSync(filePath, 'r');
+    fs.readSync(fd, buffer, 0, readSize, Math.max(0, fileSize - readSize));
+    fs.closeSync(fd);
+
+    const tail = buffer.toString('utf-8');
+    const lines = tail.split('\n').filter((line) => line.trim());
+
+    // Collect tool_result IDs from recent lines so we know which tools completed
+    const completedToolIds = new Set<string>();
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry: JsonlEntry = JSON.parse(lines[i]);
+        if (entry.message?.content && Array.isArray(entry.message.content)) {
+          for (const block of entry.message.content) {
+            if (block.type === 'tool_result' && block.tool_use_id) {
+              completedToolIds.add(block.tool_use_id);
+            }
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    // Walk backward to find the most recent meaningful entry
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry: JsonlEntry = JSON.parse(lines[i]);
+        if (entry.message?.role === 'user') {
+          return 'Processing...';
+        }
+        if (entry.message?.role === 'assistant' && entry.message.content) {
+          const entryContent = entry.message.content;
+          if (Array.isArray(entryContent)) {
+            // Find the last tool_use that hasn't been completed
+            for (let j = entryContent.length - 1; j >= 0; j--) {
+              const block = entryContent[j];
+              if (block.type === 'tool_use' && block.name && block.id) {
+                // Skip tools that already have results
+                if (completedToolIds.has(block.id)) {
+                  continue;
+                }
+
+                // Warn about unknown tools
+                if (!isKnownTool(block.name)) {
+                  logParserWarning('unknown_tool', `Unrecognized tool: ${block.name}`);
+                }
+
+                // Check if this needs approval
+                if (APPROVAL_TOOLS.includes(block.name)) {
+                  const input = block.input as Record<string, unknown> | undefined;
+                  if (block.name === 'Bash' && input?.command) {
+                    const cmd = (input.command as string).substring(0, COMMAND_LOG_PREVIEW_LENGTH);
+                    return `Approve? ${cmd}${(input.command as string).length > COMMAND_LOG_PREVIEW_LENGTH ? '...' : ''}`;
+                  }
+                  if ((block.name === 'Edit' || block.name === 'Write') && input?.file_path) {
+                    const fileName =
+                      (input.file_path as string).split('/').pop() || input.file_path;
+                    return `Approve ${block.name.toLowerCase()}: ${fileName}?`;
+                  }
+                  return `Approve ${block.name}?`;
+                }
+
+                return getToolDescription(block.name);
+              }
+            }
+          }
+          return undefined; // Assistant message, all tools completed
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    return undefined;
+  } catch (err) {
+    return undefined;
+  }
+}
+
+export function parseConversationFile(
+  filePath: string,
+  limit: number = MAX_MESSAGES,
+  preReadContent?: string
+): ConversationMessage[] {
+  const content =
+    preReadContent ?? (fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '');
+  if (!content) {
+    return [];
+  }
+
+  const lines = content.split('\n').filter((line) => line.trim());
+  _onMessagesParsed?.(lines.length);
+
+  // First pass: collect all tool results, start times, and completion times
+  const toolResults = new Map<string, string>();
+  const toolStartTimes = new Map<string, number>();
+  const toolCompleteTimes = new Map<string, number>();
+
+  for (const line of lines) {
+    try {
+      const entry: JsonlEntry = JSON.parse(line);
+      const timestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+
+      if (entry.message?.content && Array.isArray(entry.message.content)) {
+        for (const block of entry.message.content) {
+          // Track tool_use start times
+          if (block.type === 'tool_use' && block.id) {
+            toolStartTimes.set(block.id, timestamp);
+          }
+
+          // Track tool_result completion times and outputs
+          if (block.type === 'tool_result' && block.tool_use_id) {
+            toolCompleteTimes.set(block.tool_use_id, timestamp);
+
+            // Extract output content - can be string or array of content blocks
+            let output = '';
+            if (typeof block.content === 'string') {
+              output = block.content;
+            } else if (Array.isArray(block.content)) {
+              output = block.content
+                .filter((c) => c.type === 'text' && c.text)
+                .map((c) => c.text || '')
+                .join('\n');
+            }
+            toolResults.set(block.tool_use_id, output);
+          }
+        }
+      }
+    } catch {
+      // Skip malformed lines
+    }
+  }
+  const messages: ConversationMessage[] = [];
+
+  // Process from the end to get most recent messages first
+  for (let i = lines.length - 1; i >= 0 && messages.length < limit * 2; i--) {
+    try {
+      const entry: JsonlEntry = JSON.parse(lines[i]);
+
+      if (entry.type === 'user' || entry.type === 'assistant') {
+        const message = parseEntry(entry, toolResults, toolStartTimes, toolCompleteTimes);
+        if (message) {
+          messages.unshift(message); // Add to beginning to maintain order
+        }
+      } else if (entry.type === 'summary') {
+        // Legacy compaction summary — create a system message marking the compaction point
+        if (entry.summary) {
+          const timestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+          messages.unshift({
+            id: `compaction-${timestamp}`,
+            type: 'system',
+            content: cleanCompactionSummary(entry.summary),
+            timestamp,
+            isCompaction: true,
+          });
+        }
+      } else if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+        // New compaction format — the user message we just processed (messages[0]) is the summary
+        const timestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+        if (messages.length > 0 && messages[0].type === 'user') {
+          // Convert the summary user message into a compaction system message
+          // and clean cross-session noise from the summary content
+          messages[0] = {
+            ...messages[0],
+            id: `compaction-${timestamp}`,
+            type: 'system',
+            content: cleanCompactionSummary(messages[0].content),
+            isCompaction: true,
+          };
+        } else {
+          // No following user message — just insert a compaction marker
+          messages.unshift({
+            id: `compaction-${timestamp}`,
+            type: 'system',
+            content: 'Context compacted',
+            timestamp,
+            isCompaction: true,
+          });
+        }
+      } else if (entry.type === 'queue-operation') {
+        const notification = parseQueueOperation(entry);
+        if (notification) {
+          messages.unshift(notification);
+        }
+      } else {
+        // Silently ignore unknown types
+      }
+    } catch {
+      // Skip malformed lines
+    }
+  }
+
+  // Post-pass: detect skill invocations and mark the expanded user message.
+  // Two patterns:
+  //   1. User message with <command-name>/foo</command-name> → next user message is expansion
+  //   2. Assistant message with Skill tool_use → next user message (after tool_result) is expansion
+  const trimmed = messages.slice(-limit);
+  for (let i = 0; i < trimmed.length - 1; i++) {
+    // Pattern 1: <command-name> user message
+    if (trimmed[i].type === 'user') {
+      const cmdMatch = trimmed[i].content.match(/<command-name>\/([^<]+)<\/command-name>/);
+      if (cmdMatch) {
+        const skillName = cmdMatch[1];
+        for (let j = i + 1; j < trimmed.length; j++) {
+          if (trimmed[j].type === 'user' && !trimmed[j].skillName) {
+            trimmed[j].skillName = skillName;
+            break;
+          }
+          if (trimmed[j].type === 'assistant') break;
+        }
+      }
+    }
+    // Pattern 2: Assistant message with Skill tool_use
+    if (trimmed[i].type === 'assistant' && trimmed[i].toolCalls) {
+      const skillTool = trimmed[i].toolCalls!.find((tc) => tc.name === 'Skill');
+      if (skillTool) {
+        const skillName = (skillTool.input.skill as string) || 'unknown';
+        // Find the next user message with text content (skip tool_result messages which have empty content)
+        for (let j = i + 1; j < trimmed.length; j++) {
+          if (trimmed[j].type === 'user' && trimmed[j].content.trim() && !trimmed[j].skillName) {
+            trimmed[j].skillName = skillName;
+            break;
+          }
+          if (trimmed[j].type === 'assistant') break;
+        }
+      }
+    }
+  }
+  return trimmed;
+}
+
+function parseQueueOperation(entry: JsonlEntry): ConversationMessage | null {
+  const content = (entry as { content?: string }).content;
+  if (!content || !content.includes('<task-notification>')) return null;
+
+  // Parse XML fields with simple regex (no XML library needed for this structure)
+  const taskId = content.match(/<task-id>([^<]+)<\/task-id>/)?.[1] || '';
+  const outputFile = content.match(/<output-file>([^<]+)<\/output-file>/)?.[1] || '';
+  const status = content.match(/<status>([^<]+)<\/status>/)?.[1] || '';
+  const summary = content.match(/<summary>([^<]+)<\/summary>/)?.[1] || '';
+
+  if (!summary) return null;
+
+  const timestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+
+  return {
+    id: `task-${taskId}-${timestamp}`,
+    type: 'system',
+    content: summary,
+    timestamp,
+    toolCalls: outputFile
+      ? [
+          {
+            id: `task-output-${taskId}`,
+            name: 'TaskOutput',
+            input: { taskId, outputFile },
+            output: outputFile,
+            status: status === 'completed' ? 'completed' : status === 'error' ? 'error' : 'running',
+          },
+        ]
+      : undefined,
+  };
+}
+
+/**
+ * Detect CLI permission prompts rendered as text (e.g. "Do you want to make this edit?")
+ * and extract them as native chooser options. Returns null if no prompt found.
+ */
+export function parsePermissionPrompt(content: string): {
+  question: string;
+  options: QuestionOption[];
+  cleanContent: string;
+} | null {
+  // Match "Do you want to <action>?" followed by numbered options
+  // Options are prefixed with > (selected) or spaces, then "N. label"
+  // Optionally followed by footer like "Esc to cancel . Tab to amend"
+  const promptRegex =
+    /(Do you want to [^\n]+\?)\n((?:[❯\s]*\d+\.\s+[^\n]+\n?)+)(?:\n?Esc[^\n]*)?/;
+
+  const promptMatch = content.match(promptRegex);
+
+  if (!promptMatch) return null;
+
+  const question = promptMatch[1];
+  const optionsBlock = promptMatch[2];
+
+  // Parse individual options: "N. label" with optional (shortcut) suffix
+  const optionRegex = /\d+\.\s+(.+)/g;
+  const options: QuestionOption[] = [];
+  let optMatch;
+  while ((optMatch = optionRegex.exec(optionsBlock)) !== null) {
+    const rawLabel = optMatch[1].trim();
+    // Strip keyboard shortcut hints like "(shift+tab)"
+    const cleanLabel = rawLabel.replace(/\s*\([^)]*\)\s*$/, '').trim();
+    options.push({
+      label: mapPermissionLabel(cleanLabel),
+      description: question,
+    });
+  }
+
+  if (options.length === 0) return null;
+
+  // Strip the entire prompt block from content
+  const cleanContent = content.replace(promptMatch[0], '').trim();
+
+  return { question, options, cleanContent };
+}
+
+export function mapPermissionLabel(label: string): string {
+  const lower = label.toLowerCase();
+  if (lower === 'yes') return 'yes';
+  if (lower === 'no') return 'no';
+  if (lower.startsWith('yes, allow all') || lower.includes("don't ask again")) {
+    return "yes, and don't ask again for this session";
+  }
+  return lower;
+}
+
+function parseEntry(
+  entry: JsonlEntry,
+  toolResults: Map<string, string>,
+  toolStartTimes: Map<string, number>,
+  toolCompleteTimes: Map<string, number>
+): ConversationMessage | null {
+  const message = entry.message;
+  if (!message) return null;
+
+  let content = '';
+  const toolCalls: ToolCall[] = [];
+  let options: QuestionOption[] | undefined;
+  let questions: Question[] | undefined;
+  let isWaitingForChoice = false;
+  let multiSelect = false;
+
+  if (typeof message.content === 'string') {
+    content = message.content;
+  } else if (Array.isArray(message.content)) {
+    for (const block of message.content) {
+      if (block.type === 'text' && block.text) {
+        content += block.text;
+      } else if (block.type === 'tool_use') {
+        if (!block.name) {
+          logParserWarning('missing_tool_name', `tool_use block without name, id: ${block.id}`);
+          continue;
+        }
+        if (!KNOWN_TOOLS.has(block.name)) {
+          logParserWarning('unknown_tool', `Unrecognized tool in parseEntry: ${block.name}`);
+        }
+        const toolId = block.id || entry.uuid || '';
+        const output = toolResults.get(toolId);
+        const isPending = !output && output !== '';
+        const startedAt = toolStartTimes.get(toolId);
+        const completedAt = toolCompleteTimes.get(toolId);
+
+        toolCalls.push({
+          id: toolId,
+          name: block.name,
+          input: (block.input as Record<string, unknown>) || {},
+          output: output,
+          status: isPending ? 'pending' : 'completed',
+          startedAt,
+          completedAt,
+        });
+
+        // Extract options from AskUserQuestion tool (only if still pending)
+        if (block.name === 'AskUserQuestion' && isPending) {
+          const input = block.input as AskUserQuestionInput;
+          console.log(
+            `Parser: Found AskUserQuestion tool, questions count: ${input.questions?.length || 0}`
+          );
+          if (input.questions && input.questions.length > 0) {
+            // Extract all questions
+            questions = input.questions.map((q) => ({
+              question: q.question,
+              header: q.header,
+              options: q.options.map((opt) => ({
+                label: opt.label,
+                description: opt.description,
+              })),
+              multiSelect: q.multiSelect || false,
+            }));
+
+            // Set content to first question for backward compat / message bubble text
+            const firstQuestion = input.questions[0];
+            content = firstQuestion.question;
+            // Set options from first question for backward compat (single-question case)
+            options = firstQuestion.options.map((opt) => ({
+              label: opt.label,
+              description: opt.description,
+            }));
+            isWaitingForChoice = true;
+            multiSelect = firstQuestion.multiSelect || false;
+            console.log(
+              `Parser: Extracted ${questions.length} questions, first has ${options.length} options: "${content.substring(0, QUESTION_PREVIEW_LENGTH)}..." (multiSelect: ${multiSelect})`
+            );
+          }
+        } else if (block.name === 'AskUserQuestion' && !isPending) {
+          // Show the question content but no options (already answered)
+          const input = block.input as AskUserQuestionInput;
+          if (input.questions && input.questions.length > 0) {
+            content = input.questions[0].question;
+          }
+        }
+        // Add Yes/No options for pending approval tools
+        // But NOT for Task tools (background, stay "pending" long) or ExitPlanMode (has plan card UI)
+        else if (isPending && APPROVAL_TOOLS.includes(block.name) && block.name !== 'Task' && block.name !== 'ExitPlanMode') {
+          const input = block.input as Record<string, unknown>;
+          let description = '';
+
+          // Build a helpful description based on tool type
+          if (block.name === 'Bash' && input.command) {
+            description = `Run: ${(input.command as string).substring(0, TOOL_DESCRIPTION_PREVIEW_LENGTH)}`;
+          } else if ((block.name === 'Edit' || block.name === 'Write') && input.file_path) {
+            description = `${block.name}: ${input.file_path}`;
+          } else if (block.name === 'EnterPlanMode') {
+            description = 'Enter plan mode';
+          } else {
+            description = `Allow ${block.name}?`;
+          }
+
+          if (block.name === 'EnterPlanMode') {
+            // EnterPlanMode: just yes/no (2 options in CLI)
+            options = [
+              { label: 'yes', description: `Approve: ${description}` },
+              { label: 'no', description: 'Reject' },
+            ];
+          } else {
+            // Standard tool approval: yes/always/no (3 options in CLI)
+            options = [
+              { label: 'yes', description: `Approve: ${description}` },
+              {
+                label: "yes, and don't ask again for this session",
+                description: `Always allow: ${description}`,
+              },
+              { label: 'no', description: 'Reject this action' },
+            ];
+          }
+          isWaitingForChoice = true;
+          console.log(
+            `Parser: Pending ${block.name} tool needs approval: "${description.substring(0, TOOL_APPROVAL_PREVIEW_LENGTH)}..."`
+          );
+        }
+      } else if (block.type === 'tool_result') {
+        // Skip tool results entirely - they're internal assistant responses
+        // We only want to show actual user-typed messages
+      }
+    }
+  }
+
+  // Detect permission prompts in text content and strip the prompt block.
+  // Tool-based detection (lines 488-526) is the source of truth for options.
+  // Don't set options from text regex — prevents false positives when the CLI
+  // emits prompt text while actively working (no pending approval tool).
+  const permissionPrompt = parsePermissionPrompt(content);
+  if (permissionPrompt) {
+    content = permissionPrompt.cleanContent;
+  }
+
+  const timestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+
+  return {
+    id: entry.uuid || String(timestamp),
+    type: entry.type as 'user' | 'assistant',
+    content,
+    timestamp,
+    toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+    options,
+    questions,
+    isWaitingForChoice,
+    multiSelect: multiSelect || undefined,
+  };
+}
+
+/**
+ * Parse a chain of conversation files for cross-session infinite scroll.
+ * Files are ordered oldest-first. Pagination counts from the END of the
+ * newest (last) file backwards through older files.
+ *
+ * Returns { highlights, total, hasMore } matching the get_highlights contract.
+ */
+export function parseConversationChain(
+  files: string[],
+  limit: number,
+  offset: number
+): { highlights: ConversationHighlight[]; total: number; hasMore: boolean } {
+  if (files.length === 0) {
+    return { highlights: [], total: 0, hasMore: false };
+  }
+
+  // Parse all files and collect highlights per file, newest-first
+  // We cache this lazily — only parse as many files as needed
+  const allHighlights: ConversationHighlight[] = [];
+  let totalCount = 0;
+
+  // Walk from newest to oldest, stop once we have enough
+  for (let i = files.length - 1; i >= 0; i--) {
+    const messages = parseConversationFile(files[i]);
+    const highlights = extractHighlights(messages);
+
+    if (highlights.length > 0) {
+      // Insert a session boundary marker between files (not before the first/newest)
+      if (allHighlights.length > 0 && messages.length > 0) {
+        const boundaryTime = messages[messages.length - 1]?.timestamp || Date.now();
+        allHighlights.unshift({
+          id: `boundary-${i}`,
+          type: 'assistant',
+          content: `── Previous session ──`,
+          timestamp: boundaryTime,
+          isWaitingForChoice: false,
+        });
+        totalCount++;
+      }
+      // Prepend older highlights before newer ones
+      allHighlights.unshift(...highlights);
+      totalCount += highlights.length;
+    }
+
+    // Check if we have enough messages to satisfy the request
+    // We need at least offset + limit messages to paginate correctly
+    if (totalCount > offset + limit) {
+      break; // No need to parse more old files
+    }
+  }
+
+  // Paginate from the end, same logic as the existing get_highlights
+  const total = totalCount;
+  const startIdx = Math.max(0, total - offset - limit);
+  const endIdx = Math.max(total - offset, 0);
+  const resultHighlights = allHighlights.slice(startIdx, endIdx);
+  const hasMore = startIdx > 0;
+
+  return { highlights: resultHighlights, total, hasMore };
+}
+
+export function extractHighlights(messages: ConversationMessage[]): ConversationHighlight[] {
+  // Find the index of the last user message - anything before this has been "responded to"
+  const rawHighlights = messages
+    .filter((msg) => {
+      // Include user messages with content (but hide skill command triggers)
+      if (msg.type === 'user' && msg.content && msg.content.trim()) {
+        if (msg.content.includes('<command-name>')) return false;
+        return true;
+      }
+      // Include system messages (task notifications, compaction summaries)
+      if (msg.type === 'system') return true;
+      // Include assistant messages with content OR toolCalls
+      if (msg.type === 'assistant') {
+        const trimmed = msg.content?.trim();
+        const hasContent = trimmed && trimmed !== '(no content)';
+        const hasToolCalls = msg.toolCalls && msg.toolCalls.length > 0;
+        return hasContent || hasToolCalls;
+      }
+      return false;
+    })
+    .map((msg, index, arr) => {
+      // System messages pass through directly
+      if (msg.type === 'system') {
+        return {
+          id: msg.id,
+          type: 'system' as const,
+          content: msg.content,
+          timestamp: msg.timestamp,
+          toolCalls: msg.toolCalls,
+          isCompaction: msg.isCompaction,
+        };
+      }
+
+      const isLastMessage = index === arr.length - 1;
+      const originalIndex = messages.indexOf(msg);
+
+      // Check if this message has pending interactive tools (approval tools or AskUserQuestion)
+      const hasPendingInteractiveTools =
+        msg.toolCalls?.some(
+          (tc) =>
+            tc.status === 'pending' &&
+            (APPROVAL_TOOLS.includes(tc.name) || tc.name === 'AskUserQuestion') &&
+            tc.name !== 'Task'
+        ) ?? false;
+
+      // Check if all tools in this message are already completed/errored
+      const allToolsCompleted =
+        (msg.toolCalls?.length ?? 0) > 0 &&
+        msg.toolCalls?.every(
+          (tc) => tc.status === 'completed' || tc.status === 'error' || tc.output !== undefined
+        );
+
+      // Check if user already responded after this message (tool is running, not waiting)
+      const userRespondedAfter =
+        originalIndex < messages.length - 1 &&
+        messages.slice(originalIndex + 1).some((m) => m.type === 'user');
+
+      // Show options if:
+      // 1. This message has options AND
+      // 2. Either it's the last message OR it has pending approval tools AND
+      // 3. Tools haven't all completed AND
+      // 4. User hasn't already responded (tool would be running, not waiting)
+      const showOptions =
+        msg.options &&
+        msg.options.length > 0 &&
+        (isLastMessage || hasPendingInteractiveTools) &&
+        !allToolsCompleted &&
+        !userRespondedAfter;
+
+      // If user responded after this message, pending tools are now running (not waiting for approval)
+      const toolCalls =
+        userRespondedAfter && msg.toolCalls
+          ? msg.toolCalls.map((tc) =>
+              tc.status === 'pending' ? { ...tc, status: 'running' as const } : tc
+            )
+          : msg.toolCalls;
+
+      return {
+        id: msg.id,
+        type: msg.type as 'user' | 'assistant',
+        content: msg.content,
+        timestamp: msg.timestamp,
+        options: showOptions ? msg.options : undefined,
+        questions: showOptions ? msg.questions : undefined,
+        isWaitingForChoice: showOptions ? msg.isWaitingForChoice : false,
+        multiSelect: showOptions ? msg.multiSelect : undefined,
+        toolCalls,
+        skillName: msg.skillName,
+      };
+    });
+
+  // Merge consecutive assistant messages that are tool-only (no text content)
+  // into a single message so the UI can collapse them together
+  const highlights: ConversationHighlight[] = [];
+  for (const h of rawHighlights) {
+    const prev = highlights[highlights.length - 1];
+    const isToolOnly =
+      h.type === 'assistant' &&
+      (!h.content || !h.content.trim()) &&
+      h.toolCalls &&
+      h.toolCalls.length > 0;
+    const prevIsToolOnly =
+      prev &&
+      prev.type === 'assistant' &&
+      (!prev.content || !prev.content.trim()) &&
+      prev.toolCalls &&
+      prev.toolCalls.length > 0;
+
+    if (isToolOnly && prevIsToolOnly && !h.options && !prev.options) {
+      // Merge: append tool calls to previous message
+      prev.toolCalls = [...(prev.toolCalls || []), ...(h.toolCalls || [])];
+      prev.timestamp = h.timestamp; // Use latest timestamp
+    } else {
+      highlights.push(h);
+    }
+  }
+
+  // Log if the last highlight has options
+  const lastHighlight = highlights[highlights.length - 1];
+  if (lastHighlight?.options && lastHighlight.options.length > 0) {
+    console.log(`Parser: Last message has ${lastHighlight.options.length} options`);
+  }
+
+  return highlights;
+}
+
+export function detectWaitingForInput(messages: ConversationMessage[]): boolean {
+  if (messages.length === 0) return false;
+
+  const lastMessage = messages[messages.length - 1];
+
+  // If the last message is from the assistant
+  if (lastMessage.type === 'assistant') {
+    // Check for pending tool calls that need approval
+    if (lastMessage.toolCalls) {
+      // Task tools run in background for long periods — exclude from approval check
+      // (consistent with getPendingApprovalTools and extractHighlights)
+      const hasPendingApproval = lastMessage.toolCalls.some(
+        (tc) => tc.status === 'pending' && APPROVAL_TOOLS.includes(tc.name) && tc.name !== 'Task'
+      );
+      if (hasPendingApproval) {
+        return true;
+      }
+
+      // ExitPlanMode and AskUserQuestion pending = CLI is waiting for user input
+      const INTERACTIVE_TOOLS = ['ExitPlanMode', 'AskUserQuestion'];
+      const hasPendingInteractive = lastMessage.toolCalls.some(
+        (tc) => tc.status === 'pending' && INTERACTIVE_TOOLS.includes(tc.name)
+      );
+      if (hasPendingInteractive) {
+        return true;
+      }
+
+      // If any tools are still running, not waiting yet
+      if (lastMessage.toolCalls.some((tc) => tc.status === 'running')) {
+        return false;
+      }
+    }
+
+    // Assistant finished with all tools completed (or no tools) = waiting for next user input
+    if (
+      !lastMessage.toolCalls ||
+      lastMessage.toolCalls.every((tc) => tc.status === 'completed' || tc.status === 'error')
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Detect if the assistant has finished working and is idle (not actively expecting a response)
+export function detectIdle(messages: ConversationMessage[]): boolean {
+  if (messages.length === 0) return false;
+
+  const lastMessage = messages[messages.length - 1];
+
+  // If the last message is from the assistant with all tools completed and no question
+  if (lastMessage.type === 'assistant') {
+    // Still has running/pending tools = not idle
+    if (lastMessage.toolCalls?.some((tc) => tc.status === 'pending' || tc.status === 'running')) {
+      return false;
+    }
+
+    // All tools completed, no question pattern = idle (finished task)
+    if (!lastMessage.toolCalls || lastMessage.toolCalls.every((tc) => tc.status === 'completed')) {
+      return !detectWaitingForInput(messages);
+    }
+  }
+
+  return false;
+}
+
+import { ActivityDetail } from './types';
+export type { ActivityDetail } from './types';
+
+export function detectCurrentActivity(messages: ConversationMessage[]): string | undefined {
+  if (messages.length === 0) return undefined;
+
+  const lastMessage = messages[messages.length - 1];
+
+  // If last message is from user, the assistant is processing
+  if (lastMessage.type === 'user') {
+    return 'Processing...';
+  }
+
+  // Check for tool calls in the last assistant message
+  if (
+    lastMessage.type === 'assistant' &&
+    lastMessage.toolCalls &&
+    lastMessage.toolCalls.length > 0
+  ) {
+    const lastTool = lastMessage.toolCalls[lastMessage.toolCalls.length - 1];
+
+    // Check if this is a pending approval
+    if (lastTool.status === 'pending' && APPROVAL_TOOLS.includes(lastTool.name)) {
+      const input = lastTool.input as Record<string, unknown>;
+      if (lastTool.name === 'Bash' && input.command) {
+        const cmd = (input.command as string).substring(0, COMMAND_LOG_PREVIEW_LENGTH);
+        return `Approve? ${cmd}${(input.command as string).length > COMMAND_LOG_PREVIEW_LENGTH ? '...' : ''}`;
+      }
+      if ((lastTool.name === 'Edit' || lastTool.name === 'Write') && input.file_path) {
+        const filePath = input.file_path as string;
+        const fileName = filePath.split('/').pop() || filePath;
+        return `Approve ${lastTool.name.toLowerCase()}: ${fileName}?`;
+      }
+      return `Approve ${lastTool.name}?`;
+    }
+
+    const description = getToolDescription(lastTool.name);
+
+    // Add file path info if available
+    if (lastTool.input) {
+      const input = lastTool.input as Record<string, unknown>;
+      if (input.file_path) {
+        const filePath = input.file_path as string;
+        const fileName = filePath.split('/').pop() || filePath;
+        return `${description}: ${fileName}`;
+      }
+      if (input.command) {
+        const cmd = (input.command as string).substring(0, SHORT_COMMAND_DISPLAY_LENGTH);
+        return `${description}: ${cmd}${(input.command as string).length > SHORT_COMMAND_DISPLAY_LENGTH ? '...' : ''}`;
+      }
+    }
+
+    return description;
+  }
+
+  // Don't show "waiting for input" - there's already a separate indicator for that
+  return undefined;
+}
+
+export function getRecentActivity(
+  messages: ConversationMessage[],
+  limit: number = 5
+): ActivityDetail[] {
+  const activities: ActivityDetail[] = [];
+
+  // Go through messages in reverse to get recent activity
+  for (let i = messages.length - 1; i >= 0 && activities.length < limit; i--) {
+    const msg = messages[i];
+
+    if (msg.type === 'assistant' && msg.toolCalls) {
+      for (const tool of msg.toolCalls) {
+        if (activities.length >= limit) break;
+
+        const input = tool.input as Record<string, unknown>;
+        let inputStr = '';
+        const outputStr = tool.output || '';
+
+        // Format input based on tool type
+        if (input.file_path) {
+          inputStr = input.file_path as string;
+        } else if (input.command) {
+          inputStr = input.command as string;
+        } else if (input.pattern) {
+          inputStr = `Pattern: ${input.pattern}`;
+        } else if (input.query) {
+          inputStr = input.query as string;
+        }
+
+        activities.push({
+          summary: `${tool.name}${inputStr ? `: ${inputStr.substring(0, TOOL_INPUT_SUMMARY_LENGTH)}` : ''}`,
+          toolName: tool.name,
+          input: inputStr,
+          output: outputStr.substring(0, MAX_TOOL_OUTPUT_SIZE), // Limit output size
+          timestamp: msg.timestamp,
+        });
+      }
+    }
+  }
+
+  return activities.reverse(); // Return in chronological order
+}
+
+export function getSessionStatus(
+  conversationPath: string,
+  isProcessRunning: boolean
+): SessionStatus {
+  const messages = parseConversationFile(conversationPath);
+  const lastMessage = messages[messages.length - 1];
+
+  return {
+    isRunning: isProcessRunning,
+    isWaitingForInput: isProcessRunning && detectWaitingForInput(messages),
+    lastActivity: lastMessage?.timestamp || 0,
+    conversationId: conversationPath,
+    currentActivity: isProcessRunning ? detectCurrentActivity(messages) : undefined,
+  };
+}
+
+/**
+ * Get list of pending tools that need approval from the last message.
+ * Only returns tools that actually require user approval (Bash, Write, Edit, etc.)
+ * Excludes Task (runs in background), AskUserQuestion (choice prompts, not tool approval).
+ * Returns objects with both name and id so callers can distinguish different instances
+ * of the same tool (e.g., two consecutive Bash calls).
+ */
+export function getPendingApprovalTools(
+  messages: ConversationMessage[]
+): Array<{ name: string; id: string }> {
+  if (messages.length === 0) return [];
+
+  const lastMessage = messages[messages.length - 1];
+  if (lastMessage.type !== 'assistant' || !lastMessage.toolCalls) return [];
+
+  return lastMessage.toolCalls
+    .filter(
+      (tc) => tc.status === 'pending' && APPROVAL_TOOLS.includes(tc.name) && tc.name !== 'Task'
+    )
+    .map((tc) => ({ name: tc.name, id: tc.id }));
+}
+
+interface UsageData {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
+interface UsageJsonlEntry {
+  type: string;
+  timestamp?: string;
+  sessionId?: string;
+  message?: {
+    model?: string;
+    usage?: UsageData;
+  };
+}
+
+/**
+ * Detect compaction events in a conversation file
+ * Returns the most recent compaction summary if found
+ */
+export function detectCompaction(
+  filePath: string,
+  sessionId: string,
+  sessionName: string,
+  projectPath: string,
+  lastCheckedLine: number = 0,
+  preReadContent?: string
+): { event: CompactionEvent | null; lastLine: number } {
+  const content =
+    preReadContent ?? (fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '');
+  if (!content) {
+    return { event: null, lastLine: 0 };
+  }
+
+  const lines = content.split('\n').filter((line) => line.trim());
+  let compactionEvent: CompactionEvent | null = null;
+
+  // Only check lines after lastCheckedLine to avoid re-detecting old compactions
+  for (let i = lastCheckedLine; i < lines.length; i++) {
+    try {
+      const entry = JSON.parse(lines[i]);
+
+      // Look for summary type entries (context compaction) — legacy format
+      if (entry.type === 'summary' && entry.summary) {
+        const timestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+        compactionEvent = {
+          sessionId,
+          sessionName,
+          projectPath,
+          summary: cleanCompactionSummary(entry.summary),
+          timestamp,
+        };
+      }
+      // New compact_boundary format
+      if (entry.type === 'system' && entry.subtype === 'compact_boundary') {
+        const timestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+        // The summary is in the next user message (if it exists)
+        let summary = 'Context compacted';
+        if (i + 1 < lines.length) {
+          try {
+            const next = JSON.parse(lines[i + 1]);
+            if (next.type === 'user' && next.message?.content) {
+              const c = next.message.content;
+              if (typeof c === 'string') summary = c.slice(0, MAX_SUMMARY_TEXT_LENGTH);
+              else if (Array.isArray(c)) {
+                const textBlock = c.find(
+                  (b: { type: string; text?: string }) => b.type === 'text' && b.text
+                );
+                if (textBlock) summary = (textBlock.text || '').slice(0, MAX_SUMMARY_TEXT_LENGTH);
+              }
+            }
+          } catch {
+            /* skip */
+          }
+        }
+        compactionEvent = {
+          sessionId,
+          sessionName,
+          projectPath,
+          summary: cleanCompactionSummary(summary),
+          timestamp,
+        };
+      }
+    } catch {
+      // Skip malformed lines
+    }
+  }
+
+  return { event: compactionEvent, lastLine: lines.length };
+}
+
+/**
+ * Extract usage data from a conversation JSONL file
+ */
+export function extractUsageFromFile(filePath: string, sessionName: string): SessionUsage {
+  const result: SessionUsage = {
+    sessionId: filePath,
+    sessionName,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalCacheCreationTokens: 0,
+    totalCacheReadTokens: 0,
+    messageCount: 0,
+    currentContextTokens: 0,
+  };
+
+  if (!fs.existsSync(filePath)) {
+    return result;
+  }
+
+  const content = fs.readFileSync(filePath, 'utf-8');
+  const lines = content.split('\n').filter((line) => line.trim());
+  const seenMessageIds = new Set<string>();
+
+  for (const line of lines) {
+    try {
+      const entry: UsageJsonlEntry = JSON.parse(line);
+
+      // Only count assistant messages with usage data
+      if (entry.type === 'assistant' && entry.message?.usage) {
+        const msgId = (entry as { message?: { id?: string } }).message?.id;
+
+        // Skip duplicate message IDs (same message can appear multiple times as it streams)
+        if (msgId && seenMessageIds.has(msgId)) {
+          continue;
+        }
+        if (msgId) {
+          seenMessageIds.add(msgId);
+        }
+
+        const usage = entry.message.usage;
+
+        // Only add non-zero usage (final message has the totals)
+        if (usage.input_tokens && usage.input_tokens > 0) {
+          result.totalInputTokens += usage.input_tokens;
+          result.messageCount++;
+        }
+        if (usage.output_tokens && usage.output_tokens > 0) {
+          result.totalOutputTokens += usage.output_tokens;
+        }
+        if (usage.cache_creation_input_tokens && usage.cache_creation_input_tokens > 0) {
+          result.totalCacheCreationTokens += usage.cache_creation_input_tokens;
+        }
+        if (usage.cache_read_input_tokens && usage.cache_read_input_tokens > 0) {
+          result.totalCacheReadTokens += usage.cache_read_input_tokens;
+        }
+        // Track current context size from the most recent message
+        if (usage.input_tokens) {
+          result.currentContextTokens = usage.input_tokens;
+        }
+      }
+    } catch {
+      // Skip malformed lines
+    }
+  }
+
+  return result;
+}
+
+// Input types for TaskCreate/TaskUpdate tools
+interface TaskCreateInput {
+  subject: string;
+  description: string;
+  activeForm?: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface TaskUpdateInput {
+  taskId: string;
+  status?: 'pending' | 'in_progress' | 'completed' | 'deleted';
+  subject?: string;
+  description?: string;
+  activeForm?: string;
+  owner?: string;
+  addBlockedBy?: string[];
+  addBlocks?: string[];
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Extract tasks from JSONL content (from TaskCreate/TaskUpdate tool calls)
+ */
+export function extractTasks(content: string): TaskItem[] {
+  const lines = content.split('\n').filter((line) => line.trim());
+
+  // Track tasks by temporary ID (toolu_xxx) until we get real ID from result
+  const pendingTasks = new Map<string, { task: Partial<TaskItem>; timestamp: number }>();
+  // Map toolu_xxx to real task ID
+  const toolIdToTaskId = new Map<string, string>();
+  // Final tasks by real ID
+  const tasks = new Map<string, TaskItem>();
+
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+
+      if (entry.message?.content && Array.isArray(entry.message.content)) {
+        const timestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+
+        for (const block of entry.message.content) {
+          // Handle TaskCreate
+          if (block.type === 'tool_use' && block.name === 'TaskCreate') {
+            const input = block.input as TaskCreateInput;
+            const toolId = block.id as string;
+
+            pendingTasks.set(toolId, {
+              task: {
+                subject: input.subject,
+                description: input.description,
+                activeForm: input.activeForm,
+                status: 'pending',
+                blockedBy: [],
+                blocks: [],
+                createdAt: timestamp,
+                updatedAt: timestamp,
+              },
+              timestamp,
+            });
+          }
+
+          // Handle TaskUpdate
+          if (block.type === 'tool_use' && block.name === 'TaskUpdate') {
+            const input = block.input as TaskUpdateInput;
+            const taskId = input.taskId;
+
+            // Find existing task
+            const existingTask = tasks.get(taskId);
+            if (existingTask) {
+              // Handle deletion
+              if (input.status === 'deleted') {
+                tasks.delete(taskId);
+                continue;
+              }
+
+              // Apply updates
+              if (input.status) {
+                existingTask.status = input.status as TaskItem['status'];
+              }
+              if (input.subject) {
+                existingTask.subject = input.subject;
+              }
+              if (input.description) {
+                existingTask.description = input.description;
+              }
+              if (input.activeForm) {
+                existingTask.activeForm = input.activeForm;
+              } else if (input.status === 'completed') {
+                // Clear activeForm when completed
+                existingTask.activeForm = undefined;
+              }
+              if (input.owner) {
+                existingTask.owner = input.owner;
+              }
+              if (input.addBlockedBy) {
+                existingTask.blockedBy = [...(existingTask.blockedBy || []), ...input.addBlockedBy];
+              }
+              if (input.addBlocks) {
+                existingTask.blocks = [...(existingTask.blocks || []), ...input.addBlocks];
+              }
+              existingTask.updatedAt = timestamp;
+            }
+          }
+
+          // Handle tool_result to get real task IDs
+          if (block.type === 'tool_result' && block.tool_use_id) {
+            const toolId = block.tool_use_id as string;
+            const pending = pendingTasks.get(toolId);
+
+            if (pending) {
+              // Extract task ID from result content
+              let resultContent = '';
+              if (typeof block.content === 'string') {
+                resultContent = block.content;
+              } else if (Array.isArray(block.content)) {
+                resultContent = block.content
+                  .filter((c: { type: string; text?: string }) => c.type === 'text' && c.text)
+                  .map((c: { text?: string }) => c.text || '')
+                  .join('\n');
+              }
+
+              // Try to extract task ID from "Task created with ID: X"
+              const idMatch = resultContent.match(/(?:Task created with ID:|id[:\s]+)(\d+)/i);
+              if (idMatch) {
+                const realId = idMatch[1];
+                toolIdToTaskId.set(toolId, realId);
+
+                // Create the task with real ID
+                tasks.set(realId, {
+                  id: realId,
+                  subject: pending.task.subject || '',
+                  description: pending.task.description || '',
+                  status: pending.task.status || 'pending',
+                  activeForm: pending.task.activeForm,
+                  owner: pending.task.owner,
+                  blockedBy: pending.task.blockedBy,
+                  blocks: pending.task.blocks,
+                  createdAt: pending.task.createdAt || timestamp,
+                  updatedAt: pending.task.updatedAt || timestamp,
+                });
+              }
+
+              pendingTasks.delete(toolId);
+            }
+          }
+        }
+      }
+    } catch {
+      // Skip malformed lines
+    }
+  }
+
+  // Return tasks sorted by ID (numeric order)
+  return Array.from(tasks.values()).sort((a, b) => {
+    const aNum = parseInt(a.id, 10);
+    const bNum = parseInt(b.id, 10);
+    return aNum - bNum;
+  });
+}
+
+/**
+ * Extract file changes from JSONL content (from Write/Edit tool calls).
+ * Only includes completed tool calls (those with a matching tool_result).
+ * Deduplicates by file path, keeping the latest timestamp and upgrading
+ * action to 'write' if both edit and write happened on the same file.
+ */
+export function extractFileChanges(content: string): FileChange[] {
+  if (!content) return [];
+
+  const lines = content.split('\n').filter((line) => line.trim());
+
+  // First pass: collect completed tool IDs (those with tool_result)
+  const completedToolIds = new Set<string>();
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      if (entry.message?.content && Array.isArray(entry.message.content)) {
+        for (const block of entry.message.content) {
+          if (block.type === 'tool_result' && block.tool_use_id) {
+            completedToolIds.add(block.tool_use_id);
+          }
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  // Second pass: collect Write/Edit tool_use calls that have completed
+  const changesByPath = new Map<string, FileChange>();
+
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      if (entry.message?.content && Array.isArray(entry.message.content)) {
+        const timestamp = entry.timestamp ? new Date(entry.timestamp).getTime() : Date.now();
+
+        for (const block of entry.message.content) {
+          if (block.type !== 'tool_use') continue;
+          if (block.name !== 'Write' && block.name !== 'Edit') continue;
+
+          const toolId = block.id as string;
+          if (!completedToolIds.has(toolId)) continue;
+
+          const input = block.input as Record<string, unknown> | undefined;
+          const filePath = input?.file_path as string | undefined;
+          if (!filePath) continue;
+
+          const action: 'write' | 'edit' = block.name === 'Write' ? 'write' : 'edit';
+          const existing = changesByPath.get(filePath);
+
+          if (existing) {
+            // Update timestamp to latest
+            if (timestamp > existing.timestamp) {
+              existing.timestamp = timestamp;
+            }
+            // Upgrade to 'write' if a Write happened on same file
+            if (action === 'write') {
+              existing.action = 'write';
+            }
+          } else {
+            changesByPath.set(filePath, { path: filePath, action, timestamp });
+          }
+        }
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  // Return sorted by path for stable ordering
+  return Array.from(changesByPath.values()).sort((a, b) => a.path.localeCompare(b.path));
+}
